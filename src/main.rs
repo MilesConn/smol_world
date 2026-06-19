@@ -8,6 +8,22 @@ use std::f32::consts::PI;
 #[derive(Component)]
 struct Player;
 
+/// Player physics for gravity/falling
+#[derive(Component)]
+struct PlayerPhysics {
+    velocity: Vec3,
+    grounded: bool,
+}
+
+impl Default for PlayerPhysics {
+    fn default() -> Self {
+        Self {
+            velocity: Vec3::ZERO,
+            grounded: true,
+        }
+    }
+}
+
 /// Marks entities that can become transparent when occluding the player
 #[derive(Component)]
 struct Occludable {
@@ -21,15 +37,10 @@ struct MainCamera;
 /// Orbital camera controller state
 #[derive(Resource)]
 struct OrbitCamera {
-    /// Horizontal angle (yaw) in radians
     yaw: f32,
-    /// Vertical angle (pitch) in radians, clamped
     pitch: f32,
-    /// Distance from the target (fixed)
     distance: f32,
-    /// The point the camera orbits around
     target: Vec3,
-    /// Whether right mouse button is held for rotation
     rotating: bool,
 }
 
@@ -53,19 +64,15 @@ struct Garden;
 #[derive(Component)]
 struct House;
 
-/// Player movement state
-#[derive(Resource, Default)]
-struct PlayerState {
-    /// Which face of the cube the player is on (0-5)
-    current_face: usize,
-}
-
 // --- Constants ---
 const CUBE_SIZE: f32 = 4.0;
 const HALF_CUBE: f32 = CUBE_SIZE / 2.0;
 const PLAYER_HEIGHT: f32 = 0.4;
 const PLAYER_RADIUS: f32 = 0.2;
 const MOVE_SPEED: f32 = 3.0;
+const GRAVITY: f32 = 9.8;
+const RESPAWN_Y: f32 = -15.0;
+const SPAWN_POS: Vec3 = Vec3::new(0.0, HALF_CUBE + PLAYER_HEIGHT / 2.0 + PLAYER_RADIUS, 0.0);
 
 fn main() {
     App::new()
@@ -81,12 +88,12 @@ fn main() {
             ..default()
         }))
         .init_resource::<OrbitCamera>()
-        .init_resource::<PlayerState>()
         .add_systems(Startup, setup)
         .add_systems(Update, (
             orbit_camera_input,
             orbit_camera_update,
             player_movement,
+            player_gravity_and_respawn,
             occlusion_system,
         ))
         .run();
@@ -114,14 +121,15 @@ fn setup(
             base_color: Color::srgb(0.2, 0.4, 0.9),
             ..default()
         })),
-        Transform::from_translation(Vec3::new(0.0, HALF_CUBE + PLAYER_HEIGHT / 2.0 + PLAYER_RADIUS, 0.0)),
+        Transform::from_translation(SPAWN_POS),
         Player,
+        PlayerPhysics::default(),
     ));
 
-    // House - a group of shapes
+    // House
     spawn_house(&mut commands, &mut meshes, &mut materials);
 
-    // Garden - some plants/flowers
+    // Garden
     spawn_garden(&mut commands, &mut meshes, &mut materials);
 
     // Isometric camera
@@ -192,7 +200,7 @@ fn spawn_house(
         House,
     ));
 
-    // Second floor / chimney
+    // Chimney
     let chimney_color = Color::srgba(0.5, 0.3, 0.3, 1.0);
     let chimney_material = materials.add(StandardMaterial {
         base_color: chimney_color,
@@ -239,7 +247,7 @@ fn spawn_garden(
         ));
     }
 
-    // Plants / flowers (colored spheres)
+    // Plants / flowers
     let plant_configs = [
         (Vec3::new(-0.4, 0.2, -0.2), Color::srgb(0.9, 0.2, 0.3), 0.12),
         (Vec3::new(0.0, 0.25, 0.0), Color::srgb(1.0, 0.8, 0.1), 0.15),
@@ -273,7 +281,7 @@ fn spawn_garden(
         ));
     }
 
-    // Garden soil patches
+    // Garden soil
     let soil_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.4, 0.25, 0.1),
         ..default()
@@ -287,7 +295,7 @@ fn spawn_garden(
     ));
 }
 
-/// Handle camera orbit input (right mouse drag + scroll)
+/// Handle camera orbit input
 fn orbit_camera_input(
     mouse_button: Res<ButtonInput<MouseButton>>,
     mut mouse_motion: EventReader<MouseMotion>,
@@ -295,10 +303,8 @@ fn orbit_camera_input(
     mut orbit: ResMut<OrbitCamera>,
     keys: Res<ButtonInput<KeyCode>>,
 ) {
-    // Track right mouse button state for rotation
     orbit.rotating = mouse_button.pressed(MouseButton::Right);
 
-    // Also allow Q/E keys for rotation
     if keys.pressed(KeyCode::KeyQ) {
         orbit.yaw += 0.02;
     }
@@ -306,7 +312,6 @@ fn orbit_camera_input(
         orbit.yaw -= 0.02;
     }
 
-    // Mouse rotation
     if orbit.rotating {
         for event in mouse_motion.read() {
             orbit.yaw -= event.delta.x * 0.005;
@@ -316,10 +321,8 @@ fn orbit_camera_input(
         mouse_motion.clear();
     }
 
-    // Clamp pitch
     orbit.pitch = orbit.pitch.clamp(0.1, PI / 2.5);
 
-    // Scroll to zoom (for orthographic, adjust scale conceptually via distance)
     for event in scroll_events.read() {
         let scroll = match event.unit {
             MouseScrollUnit::Line => event.y,
@@ -339,7 +342,6 @@ fn orbit_camera_update(
         return;
     };
 
-    // Calculate camera position on sphere around target
     let x = orbit.distance * orbit.pitch.cos() * orbit.yaw.sin();
     let y = orbit.distance * orbit.pitch.sin();
     let z = orbit.distance * orbit.pitch.cos() * orbit.yaw.cos();
@@ -347,7 +349,6 @@ fn orbit_camera_update(
     let eye = orbit.target + Vec3::new(x, y, z);
     *transform = Transform::from_translation(eye).looking_at(orbit.target, Vec3::Y);
 
-    // Adjust orthographic scale based on distance
     if let Projection::Orthographic(ref mut ortho) = *projection {
         ortho.scale = orbit.distance * 0.002;
     }
@@ -358,12 +359,16 @@ fn player_movement(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     orbit: Res<OrbitCamera>,
-    mut player_query: Query<&mut Transform, With<Player>>,
-    mut player_state: ResMut<PlayerState>,
+    mut player_query: Query<(&mut Transform, &PlayerPhysics), With<Player>>,
 ) {
-    let Ok(mut player_transform) = player_query.get_single_mut() else {
+    let Ok((mut player_transform, physics)) = player_query.get_single_mut() else {
         return;
     };
+
+    // Only allow movement when grounded
+    if !physics.grounded {
+        return;
+    }
 
     let mut input = Vec2::ZERO;
     if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
@@ -385,101 +390,129 @@ fn player_movement(
 
     input = input.normalize();
 
-    // Get camera forward/right on the XZ plane
+    // Camera forward/right on the XZ plane (fixed: right vector was inverted)
     let forward = Vec3::new(-orbit.yaw.sin(), 0.0, -orbit.yaw.cos()).normalize();
-    let right = Vec3::new(forward.z, 0.0, -forward.x);
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
 
     let movement = (forward * input.y + right * input.x) * MOVE_SPEED * time.delta_secs();
 
-    // Update face position
     let current_pos = player_transform.translation;
     let new_pos = current_pos + movement;
 
-    // Determine which face and clamp position
-    let (face, clamped_pos) = clamp_to_cube_surface(new_pos);
-    player_state.current_face = face;
+    // Check if new position is still on the cube surface
+    let player_offset = PLAYER_HEIGHT / 2.0 + PLAYER_RADIUS;
+    if let Some(snapped) = snap_to_cube_surface(new_pos, player_offset) {
+        player_transform.translation = snapped;
 
-    player_transform.translation = clamped_pos;
-
-    // Orient player based on face normal
-    let up = get_face_normal(face);
-    if up != Vec3::ZERO {
+        // Orient player in movement direction
+        let up = surface_normal(snapped);
         let look_dir = movement.normalize_or_zero();
         if look_dir.length_squared() > 0.01 {
-            // Simple orientation: just keep upright relative to face
             let forward_on_face = look_dir - up * look_dir.dot(up);
             if forward_on_face.length_squared() > 0.001 {
                 player_transform.look_to(forward_on_face.normalize(), up);
             }
         }
+    } else {
+        // Player walked off the edge — just apply the movement, gravity will take over
+        player_transform.translation = new_pos;
     }
 }
 
-/// Clamp position to cube surface and determine face
-fn clamp_to_cube_surface(pos: Vec3) -> (usize, Vec3) {
-    let extent = HALF_CUBE - 0.3; // Keep player slightly inset from edges
+/// Gravity and respawn system
+fn player_gravity_and_respawn(
+    time: Res<Time>,
+    mut player_query: Query<(&mut Transform, &mut PlayerPhysics), With<Player>>,
+) {
+    let Ok((mut transform, mut physics)) = player_query.get_single_mut() else {
+        return;
+    };
+
+    let pos = transform.translation;
     let player_offset = PLAYER_HEIGHT / 2.0 + PLAYER_RADIUS;
 
-    // Find which face the player should be on based on position
+    // Check if player is on a cube face
+    if let Some(snapped) = snap_to_cube_surface(pos, player_offset) {
+        let dist = (pos - snapped).length();
+        if dist < 0.1 {
+            // On surface
+            physics.grounded = true;
+            physics.velocity = Vec3::ZERO;
+            transform.translation = snapped;
+            return;
+        }
+    }
+
+    // Not on surface — apply gravity
+    physics.grounded = false;
+    physics.velocity.y -= GRAVITY * time.delta_secs();
+    transform.translation += physics.velocity * time.delta_secs();
+
+    // Respawn if fallen too far
+    if transform.translation.y < RESPAWN_Y {
+        transform.translation = SPAWN_POS;
+        physics.velocity = Vec3::ZERO;
+        physics.grounded = true;
+    }
+}
+
+/// Try to snap a position to the nearest cube face. Returns None if too far from any face.
+fn snap_to_cube_surface(pos: Vec3, player_offset: f32) -> Option<Vec3> {
+    let edge_margin = 0.05; // small margin before falling off
+    let surface_threshold = player_offset + 0.3; // how close to surface counts as "on"
+
+    // Check each axis for being near a cube face
+    // Top face: y near HALF_CUBE, x and z within bounds
+    let faces: [(Vec3, f32, f32, f32); 6] = [
+        // (normal_offset_pos, bound_check_a, bound_check_b, surface_y)
+        // Top: player at y = HALF_CUBE + offset, x in [-HALF, HALF], z in [-HALF, HALF]
+        (Vec3::new(pos.x, HALF_CUBE + player_offset, pos.z), pos.x.abs(), pos.z.abs(), (pos.y - (HALF_CUBE + player_offset)).abs()),
+        // Bottom
+        (Vec3::new(pos.x, -HALF_CUBE - player_offset, pos.z), pos.x.abs(), pos.z.abs(), (pos.y - (-HALF_CUBE - player_offset)).abs()),
+        // Right (+X)
+        (Vec3::new(HALF_CUBE + player_offset, pos.y, pos.z), pos.y.abs(), pos.z.abs(), (pos.x - (HALF_CUBE + player_offset)).abs()),
+        // Left (-X)
+        (Vec3::new(-HALF_CUBE - player_offset, pos.y, pos.z), pos.y.abs(), pos.z.abs(), (pos.x - (-HALF_CUBE - player_offset)).abs()),
+        // Front (+Z)
+        (Vec3::new(pos.x, pos.y, HALF_CUBE + player_offset), pos.x.abs(), pos.y.abs(), (pos.z - (HALF_CUBE + player_offset)).abs()),
+        // Back (-Z)
+        (Vec3::new(pos.x, pos.y, -HALF_CUBE - player_offset), pos.x.abs(), pos.y.abs(), (pos.z - (-HALF_CUBE - player_offset)).abs()),
+    ];
+
+    let bound = HALF_CUBE + edge_margin;
+
+    let mut best: Option<(Vec3, f32)> = None;
+    for (snapped_pos, a, b, dist_to_surface) in &faces {
+        // Check if within the face bounds (with edge margin for falling off)
+        if *a <= bound && *b <= bound && *dist_to_surface < surface_threshold {
+            match &best {
+                None => best = Some((*snapped_pos, *dist_to_surface)),
+                Some((_, best_dist)) => {
+                    if dist_to_surface < best_dist {
+                        best = Some((*snapped_pos, *dist_to_surface));
+                    }
+                }
+            }
+        }
+    }
+
+    best.map(|(p, _)| p)
+}
+
+/// Get the surface normal at a position on the cube
+fn surface_normal(pos: Vec3) -> Vec3 {
     let abs_pos = pos.abs();
-
-    // Determine dominant axis
     if abs_pos.y >= abs_pos.x && abs_pos.y >= abs_pos.z {
-        // Top or bottom face
-        if pos.y >= 0.0 {
-            // Top face (face 0)
-            let x = pos.x.clamp(-extent, extent);
-            let z = pos.z.clamp(-extent, extent);
-            (0, Vec3::new(x, HALF_CUBE + player_offset, z))
-        } else {
-            // Bottom face (face 1)
-            let x = pos.x.clamp(-extent, extent);
-            let z = pos.z.clamp(-extent, extent);
-            (1, Vec3::new(x, -HALF_CUBE - player_offset, z))
-        }
+        if pos.y >= 0.0 { Vec3::Y } else { Vec3::NEG_Y }
     } else if abs_pos.x >= abs_pos.z {
-        // Right or left face
-        if pos.x >= 0.0 {
-            // Right face (face 2)
-            let y = pos.y.clamp(-extent, extent);
-            let z = pos.z.clamp(-extent, extent);
-            (2, Vec3::new(HALF_CUBE + player_offset, y, z))
-        } else {
-            // Left face (face 3)
-            let y = pos.y.clamp(-extent, extent);
-            let z = pos.z.clamp(-extent, extent);
-            (3, Vec3::new(-HALF_CUBE - player_offset, y, z))
-        }
+        if pos.x >= 0.0 { Vec3::X } else { Vec3::NEG_X }
     } else {
-        // Front or back face
-        if pos.z >= 0.0 {
-            // Front face (face 4)
-            let x = pos.x.clamp(-extent, extent);
-            let y = pos.y.clamp(-extent, extent);
-            (4, Vec3::new(x, y, HALF_CUBE + player_offset))
-        } else {
-            // Back face (face 5)
-            let x = pos.x.clamp(-extent, extent);
-            let y = pos.y.clamp(-extent, extent);
-            (5, Vec3::new(x, y, -HALF_CUBE - player_offset))
-        }
+        if pos.z >= 0.0 { Vec3::Z } else { Vec3::NEG_Z }
     }
 }
 
-/// Get normal vector for a face
-fn get_face_normal(face: usize) -> Vec3 {
-    match face {
-        0 => Vec3::Y,
-        1 => Vec3::NEG_Y,
-        2 => Vec3::X,
-        3 => Vec3::NEG_X,
-        4 => Vec3::Z,
-        5 => Vec3::NEG_Z,
-        _ => Vec3::Y,
-    }
-}
-
-/// Occlusion system: makes objects between camera and player transparent
+/// Occlusion system: only fades parts of the house that are behind the player
+/// relative to the camera (on the camera's side of the player plane).
 fn occlusion_system(
     camera_query: Query<&Transform, With<MainCamera>>,
     player_query: Query<&Transform, With<Player>>,
@@ -500,7 +533,10 @@ fn occlusion_system(
     let camera_pos = camera_transform.translation;
     let player_pos = player_transform.translation;
 
-    // Direction from camera to player
+    // Direction from player to camera (the plane normal at the player)
+    let player_to_camera = (camera_pos - player_pos).normalize_or_zero();
+
+    // Direction from camera to player for ray projection
     let to_player = player_pos - camera_pos;
     let ray_length = to_player.length();
     let ray_dir = to_player / ray_length;
@@ -508,25 +544,28 @@ fn occlusion_system(
     for (obj_transform, occludable, material_handle) in occludable_query.iter_mut() {
         let obj_pos = obj_transform.translation;
 
-        // Check if object is between camera and player
+        // 1. Check if object is on the camera's side of the player plane
+        //    (i.e., behind the player from camera's perspective)
+        let player_to_obj = obj_pos - player_pos;
+        let behind_player = player_to_obj.dot(player_to_camera) > 0.0;
+
+        // 2. Check if object is close to the camera-to-player ray
         let to_obj = obj_pos - camera_pos;
         let proj = to_obj.dot(ray_dir);
-
-        // Object must be between camera and player (along the ray)
         let is_between = proj > 0.0 && proj < ray_length;
 
-        // Check perpendicular distance to the ray
         let closest_point_on_ray = camera_pos + ray_dir * proj;
         let distance_to_ray = (obj_pos - closest_point_on_ray).length();
 
-        // Object is occluding if it's close to the ray and between camera and player
-        let is_occluding = is_between && distance_to_ray < 1.2;
+        // Object should be transparent only if:
+        // - It's between camera and player along the ray
+        // - It's close to the ray (within the house's radius)
+        // - It's on the camera's side of the player plane (behind the player)
+        let is_occluding = is_between && distance_to_ray < 1.2 && behind_player;
 
-        // Update material alpha
         if let Some(material) = materials.get_mut(material_handle) {
             let target_alpha = if is_occluding { 0.2 } else { 1.0 };
             let current = material.base_color.alpha();
-            // Smooth transition
             let new_alpha = current + (target_alpha - current) * 0.1;
 
             let original = occludable.original_color;
