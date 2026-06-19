@@ -92,8 +92,7 @@ fn main() {
         .add_systems(Update, (
             orbit_camera_input,
             orbit_camera_update,
-            player_movement,
-            player_gravity_and_respawn,
+            (player_movement, player_gravity_and_respawn).chain(),
             occlusion_system,
         ))
         .run();
@@ -394,17 +393,16 @@ fn player_movement(
     let forward = Vec3::new(-orbit.yaw.sin(), 0.0, -orbit.yaw.cos()).normalize();
     let right = Vec3::new(-forward.z, 0.0, forward.x);
 
-    let movement = (forward * input.y + right * input.x) * MOVE_SPEED * time.delta_secs();
+    let dt = time.delta_secs();
+    let movement = (forward * input.y + right * input.x) * MOVE_SPEED * dt;
 
     let current_pos = player_transform.translation;
     let new_pos = current_pos + movement;
 
-    // Check if new position is still on the cube surface
     let player_offset = PLAYER_HEIGHT / 2.0 + PLAYER_RADIUS;
     if let Some(snapped) = snap_to_cube_surface(new_pos, player_offset) {
         player_transform.translation = snapped;
 
-        // Orient player in movement direction
         let up = surface_normal(snapped);
         let look_dir = movement.normalize_or_zero();
         if look_dir.length_squared() > 0.01 {
@@ -414,8 +412,23 @@ fn player_movement(
             }
         }
     } else {
-        // Player walked off the edge — just apply the movement, gravity will take over
-        player_transform.translation = new_pos;
+        // Movement would overshoot edge — find furthest valid position
+        let mut best_pos = current_pos;
+        for i in 1..=10 {
+            let t = i as f32 / 10.0;
+            let test_pos = current_pos + movement * t;
+            if let Some(snapped) = snap_to_cube_surface(test_pos, player_offset) {
+                best_pos = snapped;
+            } else {
+                break;
+            }
+        }
+        // If already at edge (can't advance), allow falling off
+        if (best_pos - current_pos).length() < 0.01 {
+            player_transform.translation = current_pos + movement.normalize() * 0.1;
+        } else {
+            player_transform.translation = best_pos;
+        }
     }
 }
 
