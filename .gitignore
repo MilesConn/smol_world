@@ -1,0 +1,5 @@
+/target
+/web/smol_world.js
+/web/smol_world_bg.wasm
+/web/smol_world_bg.wasm.d.ts
+/web/smol_world.d.ts
